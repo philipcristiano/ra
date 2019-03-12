@@ -31,6 +31,7 @@ all() ->
      consistent_query,
      leader_noop_operation_enables_cluster_change,
      leader_noop_increments_machine_version,
+     follower_machine_version,
      leader_server_join,
      leader_server_leave,
      leader_is_removed,
@@ -168,8 +169,7 @@ init_test(_Config) ->
                      cluster => maps:keys(Cluster),
                      version => 1},
     SnapshotData = "hi1+2+3",
-    {LogS, _, _} = ra_log_memory:install_snapshot(SnapshotMeta, SnapshotData,
-                                                  Log0),
+    {LogS, _, _} = ra_log_memory:install_snapshot(SnapshotMeta, SnapshotData, Log0),
     meck:expect(ra_log, init, fun (_) -> LogS end),
     #{current_term := 5,
       commit_index := 3,
@@ -684,7 +684,8 @@ update_release_cursor(_Config) ->
         ra_server:update_release_cursor(2, 1, some_state, State00)),
 
     meck:expect(?FUNCTION_NAME, version, fun () -> 1 end),
-    ?assertMatch({_, _},
+    %% need to match on something for this macro
+    ?assertMatch({#{machine_version := 0}, []},
                  ra_server:update_release_cursor(2, 1, some_state, State00)),
     ok.
 
@@ -818,6 +819,7 @@ follower_pre_vote(_Config) ->
     Term = 5,
     Token = make_ref(),
     Msg = #pre_vote_rpc{candidate_id = n2, term = Term, last_log_index = 3,
+                        machine_version = 0,
                         token = Token, last_log_term = 5},
     % success
     {follower, #{current_term := Term},
@@ -826,18 +828,41 @@ follower_pre_vote(_Config) ->
         ra_server:handle_follower(Msg, State),
 
     % disallow pre votes from higher protocol version
-    {follower, #{current_term := Term},
-     [{reply, #pre_vote_result{term = Term, token = Token,
-                               vote_granted = false}}]} =
-        ra_server:handle_follower(Msg#pre_vote_rpc{version = ?RA_PROTO_VERSION+1},
-                                State),
+    ?assertMatch(
+       {follower, _,
+        [{reply, #pre_vote_result{term = Term, token = Token,
+                                  vote_granted = false}}]},
+       ra_server:handle_follower(Msg#pre_vote_rpc{version = ?RA_PROTO_VERSION+1},
+                                 State)),
 
     % but still allow from a lower protocol version
-    {follower, #{current_term := Term},
+    {follower, _,
      [{reply, #pre_vote_result{term = Term, token = Token,
                                vote_granted = true}}]} =
     ra_server:handle_follower(Msg#pre_vote_rpc{version = ?RA_PROTO_VERSION - 1},
                               State),
+
+    % disallow pre votes from higher machine version
+    {follower, _,
+     [{reply, #pre_vote_result{term = Term, token = Token,
+                               vote_granted = false}}]} =
+        ra_server:handle_follower(Msg#pre_vote_rpc{machine_version = 99},
+                                  State),
+
+    % disallow votes from a lower machine version
+    {follower, _,
+     [{reply, #pre_vote_result{term = Term, token = Token,
+                               vote_granted = false}}]} =
+    ra_server:handle_follower(Msg#pre_vote_rpc{machine_version = 1},
+                              State#{machine_version => 2}),
+
+    % allow votes for the same machine version
+    {follower, _,
+     [{reply, #pre_vote_result{term = Term, token = Token,
+                               vote_granted = true}}]} =
+    ra_server:handle_follower(Msg#pre_vote_rpc{machine_version = 2},
+                              State#{machine_version => 2}),
+
     % fail due to lower term
     % return failure and immediately enter pre_vote phase as there are
     {follower, #{current_term := 5},
@@ -869,6 +894,7 @@ pre_vote_receives_pre_vote(_Config) ->
     Term = 5,
     Token = make_ref(),
     Msg = #pre_vote_rpc{candidate_id = n2, term = Term, last_log_index = 3,
+                        machine_version = 0,
                         token = Token, last_log_term = 5},
     % success - pre vote still returns other pre vote requests
     % else we could have a dead-lock with a two process cluster with
@@ -992,7 +1018,7 @@ consistent_query(_Config) ->
 leader_noop_operation_enables_cluster_change(_Config) ->
     State00 = (base_state(3, ?FUNCTION_NAME))#{cluster_change_permitted => false},
     {leader, #{cluster_change_permitted := false} = State0, _Effects} =
-        ra_server:handle_leader({command, {noop, 1}}, State00),
+        ra_server:handle_leader({command, {noop, 0}}, State00),
     {leader, State, _} = ra_server:handle_leader({ra_log_event, {written, {4, 4, 5}}}, State0),
     AEReply = {n2, #append_entries_reply{term = 5, success = true,
                                          next_index = 5,
@@ -1004,12 +1030,13 @@ leader_noop_operation_enables_cluster_change(_Config) ->
 
 leader_noop_increments_machine_version(_Config) ->
     Mod = ?FUNCTION_NAME,
+    MacVer = 2,
     OldMacVer = 1,
     State00 = (base_state(3, ?FUNCTION_NAME))#{cluster_change_permitted => false,
+                                               machine_version => MacVer,
                                                effective_machine_version => OldMacVer},
     ModV2 = leader_noop_increments_machine_version_v2,
     meck:new(ModV2, [non_strict]),
-    MacVer = 2,
     meck:expect(Mod, version, fun () -> MacVer end),
     meck:expect(Mod, which_module, fun (1) -> Mod;
                                        (2) -> ModV2
@@ -1039,6 +1066,40 @@ leader_noop_increments_machine_version(_Config) ->
         ra_server:handle_leader(AEReply, State1),
 
     ?assert(meck:called(ModV2, apply, ['_', {machine_version, 1, 2}, '_'])),
+    ok.
+
+follower_machine_version(_Config) ->
+    MacVer = 1,
+    %
+    State00 = base_state(3, ?FUNCTION_NAME),
+    %% follower with lower machine version is adviced of higher machine version
+    Aer = #append_entries_rpc{entries = [{4, 5, {noop, MacVer}},
+                                         {5, 5, usr(new_state)}],
+                              term = 5, leader_id = n1,
+                              prev_log_index = 3,
+                              prev_log_term = 5,
+                              leader_commit = 5},
+    {follower, #{machine_version := 0,
+                 effective_machine_version := 0,
+                 last_applied := 3,
+                 commit_index := 5} = State0, _} =
+        ra_server:handle_follower(Aer, State00),
+    %% new effective machine version is detected that is lower than available
+    %% machine version
+    %% last_applied is not updated we simply "peek" at the noop command to
+    %% learn the next machine version to update it
+    ct:pal("done follower machine version"),
+    {follower, #{machine_version := 0,
+                 effective_machine_version := 1,
+                 last_applied := 3,
+                 commit_index := 5,
+                 log := _Log} = _State1, _Effects} =
+    ra_server:handle_follower({ra_log_event, {written, {4, 5, 5}}}, State0),
+
+    %% TODO: validate append entries reply effect
+
+    %% TODO: simulate that follower is updated from this state
+    %% ra_server_init
     ok.
 
 leader_server_join(_Config) ->
@@ -1377,6 +1438,7 @@ leader_receives_pre_vote(_Config) ->
     State = (base_state(5, ?FUNCTION_NAME))#{votes => 1},
     PreVoteRpc = #pre_vote_rpc{term = 5, candidate_id = n1,
                                token = Token,
+                               machine_version = 0,
                                last_log_index = 3, last_log_term = 5},
     {leader, #{}, [
                    {send_rpc, _, _},
@@ -1654,12 +1716,12 @@ empty_state(NumServers, Id) ->
 
 base_state(NumServers, MacMod) ->
     Log0 = lists:foldl(fun(E, L) ->
-                              ra_log_memory:append(E, L)
-                      end, ra_log_memory:init(#{data_dir => "", uid => <<>>}),
+                              ra_log:append(E, L)
+                      end, ra_log:init(#{data_dir => "", uid => <<>>}),
                       [{1, 1, usr(<<"hi1">>)},
                        {2, 3, usr(<<"hi2">>)},
                        {3, 5, usr(<<"hi3">>)}]),
-    {Log, _} = ra_log_memory:handle_event({written, {1, 3, 5}}, Log0),
+    {Log, _} = ra_log:handle_event({written, {1, 3, 5}}, Log0),
 
     Servers = lists:foldl(fun(N, Acc) ->
                                 Name = list_to_atom("n" ++ integer_to_list(N)),

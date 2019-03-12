@@ -160,7 +160,10 @@
                               tick_timeout => non_neg_integer(), % ms
                               await_condition_timeout => non_neg_integer()}.
 
--export_type([ra_server_state/0,
+-type config() :: ra_server_config().
+
+-export_type([config/0,
+              ra_server_state/0,
               ra_state/0,
               ra_server_config/0,
               ra_msg/0,
@@ -258,10 +261,12 @@ init(#{id := Id,
 
 recover(#{log_id := LogId,
           commit_index := CommitIndex,
+          machine_version := MacVer,
+          effective_machine_version := EffMacVer,
           effective_machine_module := MacMod,
           last_applied := LastApplied} = State0) ->
-    ?DEBUG("~s: recovering state machine from ~b to ~b~n",
-           [LogId, LastApplied, CommitIndex]),
+    ?DEBUG("~s: recovering state machine version ~b:~b from index ~b to ~b~n",
+           [LogId,  EffMacVer, MacVer, LastApplied, CommitIndex]),
     {#{log := Log0} = State, _, _} =
         apply_to(CommitIndex,
                  fun(E, S) ->
@@ -1136,6 +1141,8 @@ filter_follower_effects(Effects) ->
     lists:reverse(lists:foldl(
                     fun ({release_cursor, _, _} = C, Acc) ->
                             [C | Acc];
+                        ({release_cursor, _, _, _} = C, Acc) ->
+                            [C | Acc];
                         ({incr_metrics, _, _} = C, Acc) ->
                             [C | Acc];
                         ({aux, _} = C, Acc) ->
@@ -1417,6 +1424,7 @@ call_for_election(candidate, #{id := Id,
      [{next_event, cast, VoteForSelf}, {send_vote_requests, Reqs}]};
 call_for_election(pre_vote, #{id := Id,
                               log_id := LogId,
+                              machine_version := MacVer,
                               current_term := Term} = State0) ->
     ?DEBUG("~s: pre_vote election called for in term ~b~n", [LogId, Term]),
     Token = make_ref(),
@@ -1424,6 +1432,7 @@ call_for_election(pre_vote, #{id := Id,
     {LastIdx, LastTerm} = last_idx_term(State0),
     Reqs = [{PeerId, #pre_vote_rpc{term = Term,
                                    token = Token,
+                                   machine_version = MacVer,
                                    candidate_id = Id,
                                    last_log_index = LastIdx,
                                    last_log_term = LastTerm}}
@@ -1438,24 +1447,34 @@ call_for_election(pre_vote, #{id := Id,
 
 process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
                                          version = Version,
+                                         machine_version = TheirMacVer,
                                          token = Token,
                                          last_log_index = LLIdx,
                                          last_log_term = LLTerm},
-                 #{current_term := CurTerm}= State0)
+                 #{current_term := CurTerm,
+                   machine_version := OurMacVer}= State0)
   when Term >= CurTerm  ->
     State = update_term(Term, State0),
     LastIdxTerm = last_idx_term(State),
     case is_candidate_log_up_to_date(LLIdx, LLTerm, LastIdxTerm) of
-        true when Version =< ?RA_PROTO_VERSION ->
-            ?DEBUG("~s: granting pre-vote for ~w with last indexterm ~w"
-                   " for term ~b previous term ~b~n",
-                   [log_id(State0), Cand, {LLIdx, LLTerm}, Term, CurTerm]),
-            {FsmState, State#{voted_for => Cand},
-             [{reply, pre_vote_result(Term, Token, true)}]};
-        true ->
+        true when Version > ?RA_PROTO_VERSION->
             ?DEBUG("~s: declining pre-vote for ~w for protocol version ~b~n",
                    [log_id(State0), Cand, Version]),
             {FsmState, State, [{reply, pre_vote_result(Term, Token, false)}]};
+        true when OurMacVer =/= TheirMacVer->
+            ?DEBUG("~s: declining pre-vote for ~w their machine version ~b"
+                   " ours is ~b~n",
+                   [log_id(State0), Cand, TheirMacVer, OurMacVer]),
+            {FsmState, State, [{reply, pre_vote_result(Term, Token, false)}]};
+        true ->
+            ?DEBUG("~s: granting pre-vote for ~w"
+                   " machine version (their:ours) ~b:~b"
+                   " with last indexterm ~w"
+                   " for term ~b previous term ~b~n",
+                   [log_id(State0), Cand, TheirMacVer, OurMacVer,
+                    {LLIdx, LLTerm}, Term, CurTerm]),
+            {FsmState, State#{voted_for => Cand},
+             [{reply, pre_vote_result(Term, Token, true)}]};
         false ->
             ?DEBUG("~s: declining pre-vote for ~w for term ~b,"
                    " candidate last log index term was: ~w~n"
@@ -1619,13 +1638,15 @@ apply_to(ApplyTo, #{effective_machine_module := MachineMod} = State, Effs) ->
 apply_to(ApplyTo, ApplyFun, State, Effs) ->
     apply_to(ApplyTo, ApplyFun, 0, #{}, Effs, State).
 
-apply_to(ApplyTo, ApplyFun, NumApplied, Notifys0, Effects0,
+apply_to(ApplyTo, ApplyFun, NumApplied0, Notifys0, Effects0,
          #{last_applied := LastApplied,
            %% also local_machine_version >= current_machine_version
            %% machine_state could become {module(), MacState} to capture the
            %% current active module
+           machine_version := MacVer,
+           effective_machine_version := EffMacVer,
            machine_state := MacState0} = State0)
-  when ApplyTo > LastApplied ->
+  when ApplyTo > LastApplied andalso MacVer >= EffMacVer ->
     From = LastApplied + 1,
     To = min(From + 1024, ApplyTo),
     case fetch_entries(From, To, State0) of
@@ -1633,15 +1654,15 @@ apply_to(ApplyTo, ApplyFun, NumApplied, Notifys0, Effects0,
             %% reverse list before consing the notifications to ensure
             %% notifications are processed first
             FinalEffs = make_notify_effects(Notifys0, lists:reverse(Effects0)),
-            {State, FinalEffs, NumApplied};
+            {State, FinalEffs, NumApplied0};
         %% assert first item read is from
         {[{From, _, _} | _] = Entries, State1} ->
             {AppliedTo, State, MacState, Effects, Notifys} =
                 lists:foldl(ApplyFun, {LastApplied, State1, MacState0,
                                        Effects0, Notifys0}, Entries),
-            % {AppliedTo,_, _} = lists:last(Entries),
-            % ct:pal("applied: ~p ~nAfter: ~p", [Entries, MacState]),
-            apply_to(ApplyTo, ApplyFun, NumApplied + length(Entries),
+            %% due to machine versioning all entries may not have been applied
+            NumApplied = NumApplied0 + (AppliedTo - LastApplied),
+            apply_to(ApplyTo, ApplyFun, NumApplied,
                      Notifys, Effects, State#{last_applied => AppliedTo,
                                               machine_state => MacState})
     end;
@@ -1656,6 +1677,14 @@ make_notify_effects(Nots, Prior) ->
                       [{notify, Pid, lists:reverse(Corrs)} | Acc]
               end, Prior, Nots).
 
+apply_with(_MacMod, _Cmd,
+           {LastAppliedIdx,
+            State = #{machine_version := MacVer,
+                      effective_machine_version := Effective},
+            MacSt, Effects, Notifys})
+      when MacVer <Effective ->
+    %% we cannot apply any further entries
+    {LastAppliedIdx, State, MacSt, Effects, Notifys};
 apply_with(Module,
            {Idx, Term, {'$usr', #{ts := Ts} = CmdMeta, Cmd, ReplyType}},
            {_,
@@ -1704,15 +1733,15 @@ apply_with(_,
                     %% else just enable further cluster changes again
                     State0#{cluster_change_permitted => true}
             end,
-
     % add pending cluster change as next event
     {Effects1, State1} = add_next_cluster_change(Effects, State),
     {Idx, State1, MacSt, Effects1, Notifys};
-apply_with(_,
-           {Idx, Term, {noop, MacVer}},
+apply_with(_MacMod,
+           {Idx, Term, {noop, NextMacVer}},
            {LastAppliedIdx,
             State0 = #{current_term := CurrentTerm,
                        machine := Machine,
+                       machine_version := MacVer,
                        cluster_change_permitted := ClusterChangePerm0,
                        effective_machine_version := OldMacVer,
                        log_id := LogId}, MacSt, Effects, Notifys}) ->
@@ -1723,13 +1752,15 @@ apply_with(_,
                                 true;
                             _ -> ClusterChangePerm0
                         end,
-    case MacVer > OldMacVer of
-        true ->
+    %% can we understand the next machine version
+    IsOk = MacVer >= NextMacVer,
+    case NextMacVer > OldMacVer of
+        true when IsOk ->
             %% discover the next module to use
-            Module = ra_machine:which_module(Machine, MacVer),
+            Module = ra_machine:which_module(Machine, NextMacVer),
             %% enable cluster change if the noop command is for the current term
             State = State0#{cluster_change_permitted => ClusterChangePerm,
-                            effective_machine_version => MacVer,
+                            effective_machine_version => NextMacVer,
                             effective_machine_module => Module},
             CmdMeta = #{index => Idx,
                         %% TODO: timestamp needs to be added at command time
@@ -1737,8 +1768,21 @@ apply_with(_,
                         term => Term},
             apply_with(Module, {Idx, Term,
                                 {'$usr', CmdMeta,
-                                 {machine_version, OldMacVer, MacVer}, none}},
+                                 {machine_version, OldMacVer, NextMacVer}, none}},
                        {LastAppliedIdx, State, MacSt, Effects, Notifys});
+        true ->
+            %% we cannot make progress as we don't understand the new
+            %% machine version
+            %% update the effective machine version to stop any further entries
+            %% being applied. This is ok as a restart will be needed to
+            %% learn the new machine version which will reset it
+            %% TODO: this won't work with erlang code upgrades as they
+            %% could potentially change the latest known machine version
+            %% without a restart of the process
+            ?DEBUG("~s: unknown machine version ~b current ~b"
+                   " cannot apply any further~n", [LogId, NextMacVer, MacVer]),
+            State = State0#{effective_machine_version => NextMacVer},
+            {LastAppliedIdx, State, MacSt, Effects, Notifys};
         false ->
             State = State0#{cluster_change_permitted => ClusterChangePerm},
             {Idx, State, MacSt, Effects, Notifys}

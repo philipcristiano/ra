@@ -966,6 +966,7 @@ handle_effect(_, {send_vote_requests, VoteRequests}, _, % EvtType
     {State, Actions};
 handle_effect(RaftState, {release_cursor, Index, MacState}, EvtType,
               State0, Actions0) ->
+    %% default version
     handle_effect(RaftState, {release_cursor, Index, MacState, 0}, EvtType,
                   State0, Actions0);
 handle_effect(RaftState, {release_cursor, Index, MacState, MacVersion}, EvtType,

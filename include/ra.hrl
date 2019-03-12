@@ -104,7 +104,7 @@
 -record(pre_vote_rpc,
         {version = ?RA_PROTO_VERSION :: non_neg_integer(),
          %% servers will only vote for servers with a matching machine_version
-         machine_version :: undefined | non_neg_integer(),
+         machine_version :: non_neg_integer(),
          term :: ra_term(),
          token :: reference(),
          candidate_id :: ra_server_id(),

@@ -41,7 +41,7 @@
                 meta = #{} :: ra_log_memory_meta(),
                 snapshot :: maybe(snapshot())}).
 
--opaque ra_log_memory_state() :: #state{}.
+-type ra_log_memory_state() :: #state{} | ra_log:state().
 
 -export_type([ra_log_memory_state/0]).
 
@@ -199,7 +199,9 @@ install_snapshot(Meta, Data, #state{entries = Log0} = State) ->
     Index  = maps:get(index, Meta),
     % discard log
     Log = maps:filter(fun (K, _) -> K > Index end, Log0),
-    {State#state{entries = Log, snapshot = {Meta, Data}}, Data, []}.
+    {State#state{entries = Log, snapshot = {Meta, Data}}, Data, []};
+install_snapshot(_Meta, Data, State) ->
+    {State, Data, []}.
 
 -spec read_snapshot(State :: ra_log_memory_state()) ->
     {ok, ra_snapshot:meta(), term()}.
@@ -229,7 +231,7 @@ snapshot_index_term(#state{snapshot = undefined}) ->
 -spec update_release_cursor(ra_index(), ra_cluster(),
                             ra_machine:version(), term(),
                             ra_log_memory_state()) ->
-    ra_log_memory_state().
+    {ra_log_memory_state(), []}.
 update_release_cursor(_Idx, _Cluster, _, _MacState, State) ->
     {State, []}.
 
@@ -239,7 +241,10 @@ write_meta(_Key, _Value, _State) ->
 -spec write_meta_f(term(), term(), ra_log_memory_state()) ->
     ra_log_memory_state().
 write_meta_f(Key, Value, #state{meta = Meta} = State) ->
-    State#state{meta = Meta#{Key => Value}}.
+    State#state{meta = Meta#{Key => Value}};
+write_meta_f(_Key, _Value, State) ->
+    %% dummy case to satisfy dialyzer
+    State.
 
 can_write(_Log) ->
     true.

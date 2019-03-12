@@ -20,10 +20,11 @@ all() ->
 
 all_tests() ->
     [
-     % server_with_higher_version_needs_quorum_to_be_elected,
-     % unversioned_machine_never_sees_machine_version_command,
-     server_upgrades_machine_state_on_noop_command
-     % lower_version_does_not_apply_until_upgraded,
+     server_with_higher_version_needs_quorum_to_be_elected,
+     unversioned_machine_never_sees_machine_version_command,
+     unversioned_can_change_to_versioned,
+     server_upgrades_machine_state_on_noop_command,
+     lower_version_does_not_apply_until_upgraded
      % snapshot_persists_machine_version
     ].
 
@@ -52,6 +53,7 @@ end_per_group(_Group, _Config) ->
     ok.
 
 init_per_testcase(TestCase, Config) ->
+    ok = logger:set_primary_config(level, all),
     ra_server_sup_sup:remove_all(),
     ServerName1 = list_to_atom(atom_to_list(TestCase) ++ "1"),
     ServerName2 = list_to_atom(atom_to_list(TestCase) ++ "2"),
@@ -71,18 +73,112 @@ init_per_testcase(TestCase, Config) ->
      {server_id3, {ServerName3, node()}}
      | Config].
 
-end_per_testcase(_TestCase, _Config) ->
+end_per_testcase(_TestCase, Config) ->
+    catch ra:delete_cluster(?config(cluster, Config)),
     meck:unload(),
     ok.
 
 %%%===================================================================
 %%% Test cases
 %%%===================================================================
-server_with_higher_version_needs_quorum_to_be_elected(_Config) ->
-    error({todo, ?FUNCTION_NAME}).
+server_with_higher_version_needs_quorum_to_be_elected(Config) ->
+    ok = logger:set_primary_config(level, all),
+    Mod = ?config(modname, Config),
+    meck:new(Mod, [non_strict]),
+    meck:expect(Mod, init, fun (_) -> init_state end),
+    meck:expect(Mod, version, fun () -> 1 end),
+    meck:expect(Mod, which_module, fun (_) -> Mod end),
+    meck:expect(Mod, apply, fun (_, _, S) -> {S, ok} end),
+    Cluster = ?config(cluster, Config),
+    ClusterName = ?config(cluster_name, Config),
+    Leader = start_cluster(ClusterName, {module, Mod, #{}}, Cluster),
+    Followers = lists:delete(Leader, Cluster),
+    meck:expect(Mod, version, fun () ->
+                                      Self = self(),
+                                      case whereis(element(1, Leader)) of
+                                          Self -> 2;
+                                          _ -> 1
+                                      end
+                              end),
+    ra:stop_server(Leader),
+    ra:restart_server(Leader),
+    %% assert Leader node has correct machine version
+    {ok, _, Leader2} = ra:members(hd(Followers)),
+    ?assertNotEqual(Leader, Leader2),
 
-unversioned_machine_never_sees_machine_version_command(_Config) ->
-    error({todo, ?FUNCTION_NAME}).
+    [LastFollower] = lists:delete(Leader2, Followers),
+    meck:expect(Mod, version, fun () ->
+                                      New = [whereis(element(1, Leader)),
+                                             whereis(element(1, Leader2))],
+                                      case lists:member(self(), New) of
+                                          true -> 2;
+                                          _  -> 1
+                                      end
+                              end),
+    ra:stop_server(Leader2),
+    ra:restart_server(Leader2),
+    %% this last leader must now be a version 2 not 1
+    {ok, _, Leader3} = ra:members(Leader2),
+
+    ?assertNotEqual(LastFollower, Leader3),
+    ok.
+
+unversioned_machine_never_sees_machine_version_command(Config) ->
+    Mod = ?config(modname, Config),
+    meck:new(Mod, [non_strict]),
+    meck:expect(Mod, init, fun (_) -> init_state end),
+    meck:expect(Mod, apply, fun (_, dummy, S) ->
+                                    {S, ok};
+                                (_, {machine_version, _, _}, _) ->
+                                    exit(unexpected_machine_version_command);
+                                (_, Cmd, _) ->
+                                    {Cmd, ok}
+                            end),
+    ClusterName = ?config(cluster_name, Config),
+    ServerId = ?config(server_id, Config),
+    _ = start_cluster(ClusterName, {module, Mod, #{}}, [ServerId]),
+    % need to execute a command here to ensure the noop command has been fully
+    % applied. The wal fsync could take a few ms causing the race
+    {ok, ok, _} = ra:process_command(ServerId, dummy),
+    %% assert state_v1
+    {ok, {_, init_state}, _} = ra:leader_query(ServerId,
+                                               fun (S) -> S end),
+    ok = ra:stop_server(ServerId),
+    %% increment version
+    % meck:expect(Mod, version, fun () -> 2 end),
+    ok = ra:restart_server(ServerId),
+    {ok, ok, _} = ra:process_command(ServerId, dummy),
+
+    {ok, {_, init_state}, _} = ra:leader_query(ServerId, fun ra_lib:id/1),
+    ok.
+
+unversioned_can_change_to_versioned(Config) ->
+    Mod = ?config(modname, Config),
+    meck:new(Mod, [non_strict]),
+    meck:expect(Mod, init, fun (_) -> init_state end),
+    meck:expect(Mod, apply, fun (_, dummy, S) -> {S, ok} end),
+    ClusterName = ?config(cluster_name, Config),
+    ServerId = ?config(server_id, Config),
+    _ = start_cluster(ClusterName, {module, Mod, #{}}, [ServerId]),
+    % need to execute a command here to ensure the noop command has been fully
+    % applied. The wal fsync could take a few ms causing the race
+    {ok, ok, _} = ra:process_command(ServerId, dummy),
+    %% assert state_v1
+    {ok, {_, init_state}, _} = ra:leader_query(ServerId, fun (S) -> S end),
+    ok = ra:stop_server(ServerId),
+    meck:expect(Mod, version, fun () -> 1 end),
+    meck:expect(Mod, which_module, fun (_) -> Mod end),
+    meck:expect(Mod, apply, fun (_, dummy, S) ->
+                                    {S, ok};
+                                (_, {machine_version, 0, 1}, init_state) ->
+                                    {state_v1, ok}
+                            end),
+    %% increment version
+    ok = ra:restart_server(ServerId),
+    {ok, ok, _} = ra:process_command(ServerId, dummy),
+
+    {ok, {_, state_v1}, _} = ra:leader_query(ServerId, fun ra_lib:id/1),
+    ok.
 
 server_upgrades_machine_state_on_noop_command(Config) ->
     Mod = ?config(modname, Config),
@@ -99,7 +195,7 @@ server_upgrades_machine_state_on_noop_command(Config) ->
                             end),
     ClusterName = ?config(cluster_name, Config),
     ServerId = ?config(server_id, Config),
-    ok = start_cluster(ClusterName, {module, Mod, #{}}, [ServerId]),
+    _ = start_cluster(ClusterName, {module, Mod, #{}}, [ServerId]),
     % need to execute a command here to ensure the noop command has been fully
     % applied. The wal fsync could take a few ms causing the race
     {ok, ok, _} = ra:process_command(ServerId, dummy),
@@ -118,21 +214,67 @@ server_upgrades_machine_state_on_noop_command(Config) ->
     {ok, {_, state_v2}, _} = ra:leader_query(ServerId, fun ra_lib:id/1),
     ok.
 
-lower_version_does_not_apply_until_upgraded(_Config) ->
-    %% S1, S2, S3 with v1 - S1 leader
-    %% upgrade version to v2 for all but C3
-    %% meck:expect(Mod, version, fun () when self() == C3 -> {1, Mod};
-    %%                               () -> {1, Mod} end),
-    %% Restart S2
-    %% Restart S1
-    %% Assert S3 is not the leader
-    %% commit a command to the state machine
-    %% Validate S3 has not applied it but has a matching index
-    %% upgrade version to v2 for all
-    %% meck:expect(Mod, version, fun () -> {2, Mod} end),
-    %% Restart S3
-    %% Validate the final command has been applied
-    error({todo, ?FUNCTION_NAME}).
+lower_version_does_not_apply_until_upgraded(Config) ->
+    ok = logger:set_primary_config(level, all),
+    Mod = ?config(modname, Config),
+    meck:new(Mod, [non_strict]),
+    meck:expect(Mod, init, fun (_) -> init_state end),
+    meck:expect(Mod, version, fun () -> 1 end),
+    meck:expect(Mod, which_module, fun (_) -> Mod end),
+    meck:expect(Mod, apply, fun
+                                (_, {machine_version, _, _}, S) ->
+                                    %% retain state for machine versions
+                                    {S, ok};
+                                (_, C, _) ->
+                                    %% any other command replaces the state
+                                    {C, ok}
+                            end),
+    Cluster = ?config(cluster, Config),
+    ClusterName = ?config(cluster_name, Config),
+    %% 3 node cluster, upgrade the first two to the later version
+    %% leaving on efolower on a lower version
+    Leader = start_cluster(ClusterName, {module, Mod, #{}}, Cluster),
+    Followers = lists:delete(Leader, Cluster),
+    meck:expect(Mod, version, fun () ->
+                                      Self = self(),
+                                      case whereis(element(1, Leader)) of
+                                          Self -> 2;
+                                          _ -> 1
+                                      end
+                              end),
+    ra:stop_server(Leader),
+    ra:restart_server(Leader),
+    {ok, _, Leader2} = ra:members(Leader),
+    [LastFollower] = lists:delete(Leader2, Followers),
+    meck:expect(Mod, version, fun () ->
+                                      New = [whereis(element(1, Leader)),
+                                             whereis(element(1, Leader2))],
+                                      case lists:member(self(), New) of
+                                          true -> 2;
+                                          _  -> 1
+                                      end
+                              end),
+    ra:stop_server(Leader2),
+    ra:restart_server(Leader2),
+
+    %% process a command that should be replicated to all servers but only
+    %% applied to new machine version servers
+    {ok, ok, _} = ra:process_command(Leader, dummy),
+    %% a little sleep to make it more likely that replication is complete to
+    %% all servers and not just a quorum
+    timer:sleep(100),
+
+    %% the updated servers should have the same state
+    {ok, {{Idx, _}, dummy}, _} = ra:local_query(Leader, fun ra_lib:id/1),
+    {ok, {{Idx, _}, dummy}, _} = ra:local_query(Leader2, fun ra_lib:id/1),
+    %% the last follower with the lower machine version should not have
+    %% applied the last command
+    {ok, {{LFIdx, _}, init_state}, _} = ra:local_query(LastFollower, fun ra_lib:id/1),
+    %% TODO: the follower should have received and persisted the entry
+    %% and updated it's commit index but no its last_applied
+
+    ?assert(Idx > LFIdx),
+    ok.
 
 snapshot_persists_machine_version(_Config) ->
     error({todo, ?FUNCTION_NAME}).
@@ -151,9 +293,9 @@ validate_state_enters(States) ->
 
 start_cluster(ClusterName, Machine, ServerIds) ->
     {ok, Started, _} = ra:start_cluster(ClusterName, Machine, ServerIds),
-    _ = ra:members(hd(Started)),
+    {ok, _, Leader} = ra:members(hd(Started)),
     ?assertEqual(length(ServerIds), length(Started)),
-    ok.
+    Leader.
 
 validate_process_down(Name, 0) ->
     exit({process_not_down, Name});
